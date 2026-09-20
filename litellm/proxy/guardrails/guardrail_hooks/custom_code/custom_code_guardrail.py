@@ -14,6 +14,19 @@ Example custom code (sync):
                 return block("Social Security Number detected")
         return allow()
 
+Example custom code (block tool definitions before a proxy request):
+
+    def apply_guardrail(inputs, request_data, input_type):
+        if input_type == "request":
+            for name in request_data["tool_names"]:
+                if name.startswith("mcp__"):
+                    return block("Tool not permitted: " + name)
+        return allow()
+
+``tool_names`` contains names extracted from the original request using the
+proxy route in metadata. It is empty for requests without tools or route metadata
+and does not describe tools called in the model's response
+
 Example custom code (async with HTTP):
 
     async def apply_guardrail(inputs, request_data, input_type):
@@ -48,6 +61,7 @@ from litellm.integrations.custom_guardrail import (
     CustomGuardrail,
     log_guardrail_information,
 )
+from litellm.proxy.guardrails.tool_name_extraction import extract_request_tool_names
 from litellm.types.guardrails import GuardrailEventHooks
 from litellm.types.proxy.guardrails.guardrail_hooks.base import GuardrailConfigModel
 from litellm.types.utils import GenericGuardrailAPIInputs
@@ -272,7 +286,7 @@ class CustomCodeGuardrail(CustomGuardrail):
                 },
             ) from e
 
-    def _prepare_safe_request_data(self, request_data: Mapping[str, object]) -> dict[str, object]:
+    def _prepare_safe_request_data(self, request_data: dict[str, object]) -> dict[str, object]:
         """
         Prepare a safe subset of request_data for code execution.
 
@@ -289,12 +303,15 @@ class CustomCodeGuardrail(CustomGuardrail):
             **_metadata_bucket(request_data, "metadata"),
             **_metadata_bucket(request_data, "litellm_metadata"),
         }
+        route: Final = metadata.get("user_api_key_request_route")
+        tool_names: Final = extract_request_tool_names(route if isinstance(route, str) else "", request_data)
         return {
             "model": request_data.get("model"),
             "user_id": metadata.get("user_api_key_user_id"),
             "team_id": metadata.get("user_api_key_team_id"),
             "end_user_id": metadata.get("user_api_key_end_user_id"),
             "metadata": metadata,
+            "tool_names": tool_names,
         }
 
     def _process_result(

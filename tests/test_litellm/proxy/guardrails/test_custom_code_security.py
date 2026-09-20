@@ -363,3 +363,80 @@ def test_augmented_assignment_works():
 def test_missing_apply_guardrail_raises():
     with pytest.raises(CustomCodeCompilationError, match="apply_guardrail"):
         _compile("x = 1\n")
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "route,metadata_key,tools",
+    [
+        ("/v1/messages", "litellm_metadata", [{"name": "mcp__blocked", "input_schema": {"type": "object"}}]),
+        ("/v1/chat/completions", "metadata", [{"type": "function", "function": {"name": "mcp__blocked"}}]),
+        ("/v1/responses", "litellm_metadata", [{"type": "function", "name": "mcp__blocked", "parameters": {}}]),
+    ],
+)
+async def test_custom_code_blocks_normalized_request_tool_names(route, metadata_key, tools):
+    guardrail = _compile(
+        "def apply_guardrail(inputs, request_data, input_type):\n"
+        "    for name in request_data.get('tool_names', []):\n"
+        "        if name.startswith('mcp__'):\n"
+        "            return block('blocked tool: ' + name)\n"
+        "    return allow()\n"
+    )
+    with pytest.raises(ModifyResponseException, match="blocked tool: mcp__blocked"):
+        await guardrail.apply_guardrail(
+            inputs={"texts": ["use the tool"]},
+            request_data={
+                "model": "test-model",
+                "tools": tools,
+                "user_api_key_request_route": "/v1/embeddings",
+                "metadata": {"user_api_key_request_route": "/v1/embeddings"},
+                metadata_key: {"user_api_key_request_route": route},
+            },
+            input_type="request",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tools,expected", [([], []), ([{"name": "weather", "input_schema": {}}], ["weather"])])
+async def test_custom_code_request_tool_names_allow_and_hide_raw_tools(tools, expected):
+    guardrail = _compile(
+        "def apply_guardrail(inputs, request_data, input_type):\n"
+        "    if 'tools' in request_data or 'api_key' in request_data:\n"
+        "        return block('unsafe request data')\n"
+        "    return flag('tools', metadata={'names': request_data.get('tool_names')})\n"
+    )
+    data = {
+        "model": "test-model",
+        "api_key": "not-a-real-key",
+        "tools": tools,
+        "litellm_metadata": {"user_api_key_request_route": "/v1/messages"},
+    }
+    result = await guardrail.apply_guardrail(inputs={"texts": ["hello"]}, request_data=data, input_type="request")
+    assert result["texts"] == ["hello"]
+    entry = data["litellm_metadata"]["standard_logging_guardrail_information"][0]
+    assert entry["guardrail_response"]["metadata"]["names"] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name,blocked", [("mcp__blocked", True), ("weather", False)])
+async def test_custom_code_anthropic_translation_blocks_request_tools(name, blocked):
+    from litellm.llms.anthropic.chat.guardrail_translation.handler import AnthropicMessagesHandler
+
+    guardrail = _compile(
+        "def apply_guardrail(inputs, request_data, input_type):\n"
+        "    if 'mcp__blocked' in request_data.get('tool_names', []):\n"
+        "        return block('tool denied')\n"
+        "    return allow()\n"
+    )
+    data = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Use the tool"}],
+        "tools": [{"name": name, "input_schema": {"type": "object", "properties": {}}}],
+        "litellm_metadata": {"user_api_key_request_route": "/v1/messages"},
+    }
+    if blocked:
+        with pytest.raises(ModifyResponseException, match="tool denied"):
+            await AnthropicMessagesHandler().process_input_messages(data, guardrail)
+    else:
+        result = await AnthropicMessagesHandler().process_input_messages(data, guardrail)
+        assert result["messages"] == data["messages"]
+        assert result["tools"][0]["name"] == name
